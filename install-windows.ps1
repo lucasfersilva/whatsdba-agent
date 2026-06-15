@@ -1,7 +1,7 @@
-# ═══════════════════════════════════════════════════════════════════
-#  WhatsDBA Agent — Instalador para Windows Server
-#  Execute como Administrador: Right-click → "Run as Administrator"
-# ═══════════════════════════════════════════════════════════════════
+﻿# ===================================================================
+#  WhatsDBA Agent - Instalador para Windows Server
+#  Execute como Administrador: Right-click -> "Run as Administrator"
+# ===================================================================
 #Requires -RunAsAdministrator
 
 $AgentDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -10,11 +10,11 @@ $PythonMin = "3.11"
 
 Write-Host ""
 Write-Host "====================================================" -ForegroundColor Cyan
-Write-Host "  WhatsDBA Agent — Instalador Windows" -ForegroundColor Cyan
+Write-Host "  WhatsDBA Agent - Instalador Windows" -ForegroundColor Cyan
 Write-Host "====================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# ── 1. Verifica Python ────────────────────────────────────────────────────────
+# -- 1. Verifica Python --------------------------------------------------------
 Write-Host "Verificando Python..." -ForegroundColor Yellow
 
 # Função para encontrar o python.exe mesmo quando o PATH não foi atualizado na sessão atual
@@ -65,7 +65,7 @@ if (-not $pythonExePath) {
 $pyVer = & "$pythonExePath" --version
 Write-Host "OK: $pyVer ($pythonExePath)" -ForegroundColor Green
 
-# ── 2. Cria virtualenv ────────────────────────────────────────────────────────
+# -- 2. Cria virtualenv --------------------------------------------------------
 Write-Host ""
 Write-Host "Criando ambiente virtual..." -ForegroundColor Yellow
 Set-Location $AgentDir
@@ -98,7 +98,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "OK: dependencias instaladas" -ForegroundColor Green
 
-# ── 3. Verifica ODBC Driver (SQL Server) ─────────────────────────────────────
+# -- 3. Verifica ODBC Driver (SQL Server) -------------------------------------
 Write-Host ""
 Write-Host "Verificando ODBC Driver 17 para SQL Server..." -ForegroundColor Yellow
 $odbc = Get-ItemProperty "HKLM:\SOFTWARE\ODBC\ODBCINST.INI\ODBC Driver 17 for SQL Server" -ErrorAction SilentlyContinue
@@ -110,7 +110,7 @@ if ($odbc) {
     Write-Host "  (Necessario apenas para monitorar SQL Server)" -ForegroundColor Yellow
 }
 
-# ── 4. Verifica .env ──────────────────────────────────────────────────────────
+# -- 4. Verifica .env ----------------------------------------------------------
 Write-Host ""
 if (-not (Test-Path "$AgentDir\.env")) {
     Copy-Item "$AgentDir\.env.example" "$AgentDir\.env"
@@ -126,7 +126,7 @@ if (-not (Test-Path "$AgentDir\.env")) {
     Read-Host "Pressione Enter apos salvar o .env para continuar"
 }
 
-# ── 5. Instala como Windows Service via NSSM ──────────────────────────────────
+# -- 5. Instala como Windows Service via NSSM ----------------------------------
 Write-Host ""
 Write-Host "Instalando como Windows Service..." -ForegroundColor Yellow
 
@@ -195,7 +195,7 @@ if ($existingService) {
 }
 
 if ($useNssm) {
-    # ── Instala via NSSM (melhor suporte a logs e restart) ──────────────
+    # -- Instala via NSSM (melhor suporte a logs e restart) --------------
     & $nssm install  $ServiceName $pythonExe $mainScript
     & $nssm set      $ServiceName AppDirectory  $AgentDir
     & $nssm set      $ServiceName DisplayName   "WhatsDBA Agent"
@@ -208,7 +208,7 @@ if ($useNssm) {
     & $nssm set      $ServiceName AppRestartDelay 5000
     & $nssm start    $ServiceName
 } else {
-    # ── Fallback: wrapper .bat + sc.exe ────────────────────────────────
+    # -- Fallback: wrapper .bat + sc.exe --------------------------------
     # Cria um wrapper .bat que o sc.exe consegue executar
     $wrapperBat = "$AgentDir\run-service.bat"
     @"
