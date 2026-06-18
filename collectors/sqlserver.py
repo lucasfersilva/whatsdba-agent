@@ -5,12 +5,20 @@ Coleta: queries caras, deadlocks, status, sessões ativas, uso de CPU/memória.
 
 import pyodbc
 import logging
+import time
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 # Bancos de sistema que nunca devem ser monitorados
 _SYSTEM_DBS = {"master", "tempdb", "model", "msdb", "distribution", "reportserver", "reportservertempdb"}
+
+# ── Cache de deadlocks por instância ─────────────────────────────────────────
+# A query do ring buffer XE é cara (CAST XML do buffer inteiro) e retorna
+# dados de nível de INSTÂNCIA — não faz sentido rodar N vezes por ciclo.
+# Cache: (host, port) → {"ts": monotonic, "data": [...]}
+_deadlock_cache: dict[tuple, dict] = {}
+_DEADLOCK_CACHE_TTL = 50  # segundos — ligeiramente abaixo do COLLECT_INTERVAL padrão (60s)
 
 
 def discover_databases(instance_cfg: dict) -> list[dict]:
@@ -114,6 +122,70 @@ def get_connection(cfg: dict):
         f"Connection Timeout=5;"
     )
     return pyodbc.connect(conn_str, timeout=5)
+
+
+def _get_deadlocks_cached(instance_key: tuple, conn) -> list:
+    """
+    Retorna deadlocks das últimas 24h do ring buffer XE.
+
+    Usa cache TTL por instância: o ring buffer é dado de nível de instância,
+    não de banco. Em ambientes com N bancos monitorados, sem cache a mesma
+    query cara rodaria N vezes por ciclo. Aqui roda 1×, as demais usam cache.
+    """
+    cached = _deadlock_cache.get(instance_key)
+    if cached and (time.monotonic() - cached["ts"]) < _DEADLOCK_CACHE_TTL:
+        logger.debug(f"[deadlock cache HIT] {instance_key}")
+        return cached["data"]
+
+    logger.debug(f"[deadlock cache MISS] {instance_key} — consultando ring buffer")
+    deadlocks = []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                xdr.value('@timestamp', 'datetime2') AS deadlock_time,
+                xdr.value('(data[@name="xml_report"]/value/deadlock/victim-list/victimProcess/@id)[1]', 'nvarchar(50)') AS victim_id,
+                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[1]/inputbuf)[1]', 'nvarchar(2000)') AS query1,
+                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[2]/inputbuf)[1]', 'nvarchar(2000)') AS query2,
+                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[1]/@id)[1]', 'nvarchar(50)') AS proc_id1,
+                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[1]/@loginname)[1]', 'nvarchar(100)') AS login1,
+                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[2]/@loginname)[1]', 'nvarchar(100)') AS login2,
+                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[1]/@waitresource)[1]', 'nvarchar(500)') AS wait_resource
+            FROM (
+                SELECT CAST(target_data AS XML) AS target_data
+                FROM sys.dm_xe_session_targets xet
+                JOIN sys.dm_xe_sessions xes ON xes.address = xet.event_session_address
+                WHERE xes.name = 'system_health'
+                  AND xet.target_name = 'ring_buffer'
+            ) AS data
+            CROSS APPLY target_data.nodes('//RingBufferTarget/event[@name="xml_deadlock_report"]') AS xEventData(xdr)
+            WHERE xdr.value('@timestamp', 'datetime2') >= DATEADD(HOUR, -24, GETUTCDATE())
+            ORDER BY deadlock_time DESC
+            OPTION (MAXDOP 1)
+        """)
+        for row in cursor.fetchall():
+            deadlock_time, victim_id, q1, q2, proc_id1, login1, login2, wait_resource = row
+            if victim_id and victim_id == proc_id1:
+                victim_query, blocking_query = q1, q2
+                login_victim, login_blocking = login1, login2
+            else:
+                victim_query, blocking_query = q2, q1
+                login_victim, login_blocking = login2, login1
+
+            deadlocks.append({
+                "deadlock_time": str(deadlock_time),
+                "victim_query": (victim_query or "").strip()[:2000],
+                "blocking_query": (blocking_query or "").strip()[:2000],
+                "wait_resource": (wait_resource or "").strip()[:500],
+                "login_victim": login_victim or "",
+                "login_blocking": login_blocking or "",
+            })
+        cursor.close()
+    except Exception as e:
+        logger.warning(f"[deadlock] Erro ao ler ring buffer: {e}")
+
+    _deadlock_cache[instance_key] = {"ts": time.monotonic(), "data": deadlocks}
+    return deadlocks
 
 
 def collect(cfg: dict) -> dict:
@@ -232,6 +304,7 @@ def collect(cfg: dict) -> dict:
             WHERE qs.execution_count > 0
               AND st.dbid = DB_ID()
             ORDER BY qs.total_worker_time / qs.execution_count DESC
+            OPTION (MAXDOP 1)
         """)
         for row in cursor.fetchall():
             result["expensive_queries"].append({
@@ -246,45 +319,10 @@ def collect(cfg: dict) -> dict:
             })
 
         # ── Deadlocks recentes (últimas 24h via XE ring buffer) ───────────────
-        cursor.execute("""
-            SELECT
-                xdr.value('@timestamp', 'datetime2') AS deadlock_time,
-                xdr.value('(data[@name="xml_report"]/value/deadlock/victim-list/victimProcess/@id)[1]', 'nvarchar(50)') AS victim_id,
-                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[1]/inputbuf)[1]', 'nvarchar(2000)') AS query1,
-                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[2]/inputbuf)[1]', 'nvarchar(2000)') AS query2,
-                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[1]/@id)[1]', 'nvarchar(50)') AS proc_id1,
-                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[1]/@loginname)[1]', 'nvarchar(100)') AS login1,
-                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[2]/@loginname)[1]', 'nvarchar(100)') AS login2,
-                xdr.value('(data[@name="xml_report"]/value/deadlock/process-list/process[1]/@waitresource)[1]', 'nvarchar(500)') AS wait_resource
-            FROM (
-                SELECT CAST(target_data AS XML) AS target_data
-                FROM sys.dm_xe_session_targets xet
-                JOIN sys.dm_xe_sessions xes ON xes.address = xet.event_session_address
-                WHERE xes.name = 'system_health'
-                  AND xet.target_name = 'ring_buffer'
-            ) AS data
-            CROSS APPLY target_data.nodes('//RingBufferTarget/event[@name="xml_deadlock_report"]') AS xEventData(xdr)
-            WHERE xdr.value('@timestamp', 'datetime2') >= DATEADD(HOUR, -24, GETUTCDATE())
-            ORDER BY deadlock_time DESC
-        """)
-        for row in cursor.fetchall():
-            deadlock_time, victim_id, q1, q2, proc_id1, login1, login2, wait_resource = row
-            # A vítima é o processo cancelado pelo SQL Server
-            if victim_id and victim_id == proc_id1:
-                victim_query, blocking_query = q1, q2
-                login_victim, login_blocking = login1, login2
-            else:
-                victim_query, blocking_query = q2, q1
-                login_victim, login_blocking = login2, login1
-
-            result["deadlocks"].append({
-                "deadlock_time": str(deadlock_time),
-                "victim_query": (victim_query or "").strip()[:2000],
-                "blocking_query": (blocking_query or "").strip()[:2000],
-                "wait_resource": (wait_resource or "").strip()[:500],
-                "login_victim": login_victim or "",
-                "login_blocking": login_blocking or "",
-            })
+        # Usa cache por instância: a query lê o ring buffer INTEIRO e é cara.
+        # Com múltiplos bancos na mesma instância, rodaria N vezes — aqui roda 1×.
+        instance_key = (cfg["host"], cfg.get("port", 1433))
+        result["deadlocks"] = _get_deadlocks_cached(instance_key, conn)
 
         if result["deadlocks"]:
             result["alerts"].append({
