@@ -130,8 +130,8 @@ def collect(cfg: dict) -> dict:
                 COUNT_STAR AS execution_count,
                 ROUND(AVG_TIMER_WAIT / 1e9, 2) AS avg_elapsed_ms,
                 ROUND(SUM_TIMER_WAIT / 1e9, 2) AS total_elapsed_ms,
-                ROUND(AVG_ROWS_EXAMINED, 0) AS avg_rows_examined,
-                ROUND(AVG_ROWS_SENT, 0) AS avg_rows_sent,
+                ROUND(IF(COUNT_STAR > 0, SUM_ROWS_EXAMINED / COUNT_STAR, 0), 0) AS avg_rows_examined,
+                ROUND(IF(COUNT_STAR > 0, SUM_ROWS_SENT / COUNT_STAR, 0), 0) AS avg_rows_sent,
                 SCHEMA_NAME AS database_name,
                 LAST_SEEN AS last_seen
             FROM performance_schema.events_statements_summary_by_digest
